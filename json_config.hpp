@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iostream>
 
 namespace phosphor::fan
 {
@@ -36,9 +37,16 @@ using namespace phosphor::logging;
 constexpr auto confOverridePath = "/etc/phosphor-fan-presence";
 constexpr auto confBasePath = "/usr/share/phosphor-fan-presence";
 constexpr auto confCompatServ = "xyz.openbmc_project.EntityManager";
+# ifdef USE_IBM_COMPATIBLE_SYSTEM
 constexpr auto confCompatIntf =
     "xyz.openbmc_project.Configuration.IBMCompatibleSystem";
 constexpr auto confCompatProp = "Names";
+# else
+// PDI description: Implement to provide basic item attributes.
+// Required by all objects within the inventory namespace.
+constexpr auto confCompatIntf = "xyz.openbmc_project.Inventory.Item";
+constexpr auto confCompatProp = "PrettyName";
+#endif
 
 /**
  * @class NoConfigFound - A no JSON configuration found exception
@@ -104,6 +112,7 @@ class JsonConfig
      */
     JsonConfig(std::function<void()> func) : _loadFunc(func)
     {
+        std::cerr << "Chau: JsonConfig()\n";
         std::vector<std::string> compatObjPaths;
 
         _match = std::make_unique<sdbusplus::bus::match_t>(
@@ -128,14 +137,26 @@ class JsonConfig
             {
                 try
                 {
+#ifdef USE_IBM_COMPATIBLE_SYSTEM
                     // Retrieve json config compatible relative path
                     // locations (last one found will be what's used if more
-                    // than one dbus object implementing the comptaible
+                    // than one dbus object implementing the compatible
                     // interface exists).
                     _confCompatValues =
                         util::SDBusPlus::getProperty<std::vector<std::string>>(
                             util::SDBusPlus::getBus(), path, confCompatIntf,
                             confCompatProp);
+#else
+                    // There should be more than one service and object path
+                    // implementing this interface. Since the target property
+                    // is a string, archive all the found results to look for
+                    // the correct one later.
+                    std::string propValue =
+                        util::SDBusPlus::getProperty<std::string>(
+                            util::SDBusPlus::getBus(), path, confCompatIntf,
+                            confCompatProp);
+                    _confCompatValues.emplace_back(propValue);
+#endif
                 }
                 catch (const util::DBusError&)
                 {
@@ -143,23 +164,21 @@ class JsonConfig
                     // path's compatible interface, ignore
                 }
             }
+        }
+
+        // Check if required config(s) are found, otherwise this is intended to
+        // catch the exception thrown by the getConfFile function when the
+        // required config file was not found. This would then result in waiting
+        // for the compatible interfacesAdded signal
+        try
+        {
+            std::cerr << "Chau: _loadFunc()\n";
             _loadFunc();
         }
-        else
+        catch (const NoConfigFound&)
         {
-            // Check if required config(s) are found not needing the
-            // compatible interface, otherwise this is intended to catch the
-            // exception thrown by the getConfFile function when the
-            // required config file was not found. This would then result in
-            // waiting for the compatible interfacesAdded signal
-            try
-            {
-                _loadFunc();
-            }
-            catch (const NoConfigFound&)
-            {
-                // Wait for compatible interfacesAdded signal
-            }
+            std::cerr << "Chau: NoConfigFound, wait for compatible interfacesAdded signal\n";
+            // Wait for compatible interfacesAdded signal
         }
     }
 
@@ -175,22 +194,43 @@ class JsonConfig
      */
     void compatIntfAdded(sdbusplus::message_t& msg)
     {
+        std::cerr << "Chau: compatIntfAdded()\n";
+#ifndef USE_IBM_COMPATIBLE_SYSTEM
+        // Avoid processing any interface added when there's already a
+        // valid folder name to look for configs. _validCompatValue is
+        // cleared when getConfFile() fails to find configs under this
+        // folder name.
+        if (!_validCompatValue.empty())
+        {
+            std::cerr << "Chau: _validCompatValue is not empty " << _validCompatValue << "\n";
+            return;
+        }
+#endif
+        std::cerr << "Chau: _validCompatValue is empty\n";
         sdbusplus::message::object_path op;
         std::map<std::string,
-                 std::map<std::string, std::variant<std::vector<std::string>>>>
+                 std::map<std::string, std::variant<std::vector<std::string>, std::string>>>
             intfProps;
 
         msg.read(op, intfProps);
 
         if (intfProps.find(confCompatIntf) == intfProps.end())
         {
+            std::cerr << "Chau: can't find target inf\n";
             return;
         }
 
         const auto& props = intfProps.at(confCompatIntf);
+
+#ifdef USE_IBM_COMPATIBLE_SYSTEM
         // Only one dbus object with the compatible interface is used at a time
         _confCompatValues =
             std::get<std::vector<std::string>>(props.at(confCompatProp));
+#else
+        std::string propValue =
+            std::get<std::string>(props.at(confCompatProp));
+        _confCompatValues.emplace_back(propValue);
+#endif
         _loadFunc();
     }
 
@@ -219,10 +259,12 @@ class JsonConfig
                                       const std::string& fileName,
                                       bool isOptional = false)
     {
+        std::cerr << "Chau: getConfFile() for " << appName << " " << fileName  << "\n";
         // Check override location
         fs::path confFile = fs::path{confOverridePath} / appName / fileName;
         if (fs::exists(confFile))
         {
+            std::cerr << "Chau: default\n";
             return confFile;
         }
 
@@ -230,26 +272,37 @@ class JsonConfig
         confFile = fs::path{confBasePath} / appName / fileName;
         if (fs::exists(confFile))
         {
+            std::cerr << "Chau: default\n";
             return confFile;
         }
 
         // Look for a config file at each entry relative to the base
         // path and use the first one found
+        std::cerr << "Chau confFile :\n";
         auto it =
             std::find_if(_confCompatValues.begin(), _confCompatValues.end(),
                          [&confFile, &appName, &fileName](const auto& value) {
             confFile = fs::path{confBasePath} / appName / value / fileName;
+            std::cerr << " " << confFile << " ";
+            _validCompatValue = value;
             return fs::exists(confFile);
             });
+
+        std::cerr << "\n";
+
         if (it == _confCompatValues.end())
         {
+            std::cerr << "Chau: Can't find config it == _confCompatValues.end()\n";
             confFile.clear();
+            _validCompatValue.clear();
         }
 
         if (confFile.empty() && !isOptional)
         {
             throw NoConfigFound(appName, fileName);
         }
+
+        std::cerr << "Chau: _validCompatValue: " << _validCompatValue << "\n";
 
         return confFile;
     }
@@ -334,6 +387,9 @@ class JsonConfig
      * interface, the last one found will be the list of compatible values used.
      */
     inline static std::vector<std::string> _confCompatValues;
+
+    inline static std::string _validCompatValue;
+
 };
 
 } // namespace phosphor::fan
